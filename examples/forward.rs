@@ -1,36 +1,32 @@
-use std::net::{IpAddr, SocketAddr};
+/// to run this example, you should set the policy routing **after the start of the main program**
+///
+/// linux:
+/// on the first terminal:
+/// `cargo run --example forward -- -i eth0 # replace eth0 with your interface`
+/// on the second terminal:
+/// `ip rule add to 1.1.1.1 table 200`
+/// `ip route add default dev utun8 table 200`
+/// `curl 1.1.1.1`
+///
+/// to test the routing loop detection, you can run cargo with `ROUTING_LOOP_DETECTOR_NO_BIND=1`
+/// this will disable the bind to device (mocking real world scenario, like the device is down, or the os routing table is changed)
+/// to return after detection, you can run cargo with `RETURN_ON_LOOPHOLE=1`, or if you can leave it empty, then there will be only warning log
+/// log only after loophole: `ROUTING_LOOP_DETECTOR_NO_BIND=1 cargo run --example forward -- -i eth0`
+/// drop after loophole: `RETURN_ON_LOOPHOLE=1 ROUTING_LOOP_DETECTOR_NO_BIND=1 cargo run --example forward -- -i eth0`
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use futures::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, TcpListener, UdpSocket};
 use structopt::StructOpt;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::{
+    net::{TcpSocket, TcpStream},
+    sync::Mutex,
+};
 use tracing::{error, info, warn};
-
-// to run this example, you should set the policy routing **after the start of the main program**
-//
-// linux:
-// with bind device:
-// `curl 1.1.1.1 --interface utun8`
-// with default route:
-// `bash scripts/route-linux.sh add`
-// `curl 1.1.1.1`
-// with single route:
-// `ip rule add to 1.1.1.1 table 200`
-// `ip route add default dev utun8 table 200`
-// `curl 1.1.1.1`
-//
-// macos:
-// with default route:
-// `bash scripts/route-macos.sh add`
-// `curl 1.1.1.1`
-//
-// windows:
-// with default route:
-// tun2 set default route automatically, won't set agian
-// # `powershell.exe scripts/route-windows.ps1 add`
-// `curl 1.1.1.1`
-//
-// currently, the example only supports the TCP stream, and the UDP packet will be dropped.
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "forward", about = "Simply forward tun tcp/udp traffic.")]
@@ -41,7 +37,7 @@ struct Opt {
     interface: String,
 
     /// name of the tun device, default to rtun8.
-    #[structopt(short = "n", long = "name", default_value = "rtun8")]
+    #[structopt(short = "n", long = "name", default_value = "utun8")]
     name: String,
 
     /// Tracing subscriber log level.
@@ -99,7 +95,7 @@ async fn main_exec(opt: Opt) {
         cfg.tun_name(&opt.name)
             .address("10.10.10.2")
             .destination("10.10.10.1")
-            .mtu(tun2::DEFAULT_MTU);
+            .mtu(1500);
         #[cfg(not(any(target_arch = "mips", target_arch = "mips64",)))]
         {
             cfg.netmask("255.255.255.0");
@@ -136,7 +132,7 @@ async fn main_exec(opt: Opt) {
     futs.push(tokio_spawn!(async move {
         while let Some(pkt) = stack_stream.next().await {
             if let Ok(pkt) = pkt {
-                match tun_sink.send(pkt).await {
+                match tun_sink.send(pkt.into()).await {
                     Ok(_) => {}
                     Err(e) => warn!("failed to send packet to TUN, err: {:?}", e),
                 }
@@ -148,7 +144,7 @@ async fn main_exec(opt: Opt) {
     futs.push(tokio_spawn!(async move {
         while let Some(pkt) = tun_stream.next().await {
             if let Ok(pkt) = pkt {
-                match stack_sink.send(pkt).await {
+                match stack_sink.send(pkt.into()).await {
                     Ok(_) => {}
                     Err(e) => warn!("failed to send packet to stack, err: {:?}", e),
                 };
@@ -180,14 +176,107 @@ async fn main_exec(opt: Opt) {
         });
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HookStatus {
+    has_inbound: bool,
+    has_outbound: bool,
+}
+
+pub struct Detector {
+    inner: HashMap<SocketAddr, HookStatus>,
+}
+
+impl Detector {
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    pub fn insert_inbound(&mut self, addr: SocketAddr) {
+        self.inner
+            .entry(addr)
+            .or_insert(Default::default())
+            .has_inbound = true;
+    }
+
+    pub fn insert_outbound(&mut self, addr: SocketAddr) {
+        self.inner
+            .entry(addr)
+            .or_insert(Default::default())
+            .has_outbound = true;
+    }
+
+    pub fn remove(&mut self, addr: &SocketAddr) {
+        let _ = self.inner.remove(addr);
+    }
+
+    pub fn get(&self, addr: &SocketAddr) -> Option<&HookStatus> {
+        self.inner.get(addr)
+    }
+}
+
 /// simply forward tcp stream
 async fn handle_inbound_stream(mut tcp_listener: TcpListener, interface: String) {
+    let return_on_loophole = std::env::var("RETURN_ON_LOOPHOLE") == Ok("1".into());
+    let routing_loop_detector = Arc::new(Mutex::new(Detector::new()));
+
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
+        // detect routing loop
+        // if the outbound connection has been established, and it's the same address as here
+        // then we should drop the ingress connection
+        if routing_loop_detector
+            .lock()
+            .await
+            .get(&local)
+            .map(|s| s.has_outbound)
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                "[inbound handler] - [TCP], routing loop detected, drop connection to {:?}",
+                local
+            );
+            if return_on_loophole {
+                continue;
+            }
+        }
+        routing_loop_detector.lock().await.insert_inbound(local);
+
         let interface = interface.clone();
+        let detector = routing_loop_detector.clone();
+
         tokio::spawn(async move {
-            info!("new tcp connection: {:?} => {:?}", local, remote);
+            info!("ingress tcp connection: {:?} => {:?}", local, remote);
             match new_tcp_stream(remote, &interface).await {
                 Ok(mut remote_stream) => {
+                    let egress_local_addr = remote_stream.local_addr().unwrap();
+                    let remote_stream_remote = remote_stream.peer_addr().unwrap();
+                    tracing::info!(
+                        "egress tcp stream {:?}=>{:?}",
+                        egress_local_addr,
+                        remote_stream_remote
+                    );
+                    // detect routing loop
+                    // if the inbound connection has been established, and it's the same address as here
+                    // then we should drop the egress connection
+                    if detector
+                        .lock()
+                        .await
+                        .get(&egress_local_addr)
+                        .map(|s| s.has_inbound)
+                        .unwrap_or(false)
+                    {
+                        tracing::warn!(
+                            "[outbound handler] - [TCP], routing loop detected, drop connection from {:?}",
+                            egress_local_addr
+                        );
+                        if return_on_loophole {
+                            detector.lock().await.remove(&egress_local_addr);
+                            return;
+                        }
+                    }
+                    detector.lock().await.insert_outbound(egress_local_addr);
+
                     // pipe between two tcp stream
                     match tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
                         Ok(_) => {}
@@ -196,6 +285,10 @@ async fn handle_inbound_stream(mut tcp_listener: TcpListener, interface: String)
                             local, remote, e
                         ),
                     }
+                    // TODO: must ensure the entry is removed from the detector when the connection is closed
+                    // can we guarantee about that? no panic in ProxyStream's AsyncRead/AsyncWrite?
+                    // if not, what's the fallback plan? timer? what's the ownership of this addr then?
+                    detector.lock().await.remove(&egress_local_addr);
                 }
                 Err(e) => warn!(
                     "failed to new tcp stream {:?}=>{:?}, err: {:?}",
@@ -208,6 +301,8 @@ async fn handle_inbound_stream(mut tcp_listener: TcpListener, interface: String)
 
 /// simply forward udp datagram
 async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
+    let return_on_loophole = std::env::var("RETURN_ON_LOOPHOLE") == Ok("1".into());
+    let routing_loop_detector = Arc::new(Mutex::new(Detector::new()));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
     tokio::spawn(async move {
@@ -217,12 +312,50 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
     });
 
     while let Some((data, local, remote)) = read_half.next().await {
+        // detect routing loop
+        // if the outbound connection has been established, and it's the same address as here
+        // then we should drop the ingress connection
+        if routing_loop_detector
+            .lock()
+            .await
+            .get(&local)
+            .map(|s| s.has_outbound)
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                "[inbound handler] - [UDP], routing loop detected, drop connection to {:?}",
+                local
+            );
+            continue;
+        }
+        routing_loop_detector.lock().await.insert_inbound(local);
+
+        let detector = routing_loop_detector.clone();
         let tx = tx.clone();
         let interface = interface.clone();
         tokio::spawn(async move {
             info!("new udp datagram: {:?} => {:?}", local, remote);
             match new_udp_packet(remote, &interface).await {
                 Ok(remote_socket) => {
+                    let egress_local_addr = remote_socket.local_addr().unwrap();
+                    if detector
+                        .lock()
+                        .await
+                        .get(&egress_local_addr)
+                        .map(|s| s.has_inbound)
+                        .unwrap_or(false)
+                    {
+                        tracing::warn!(
+                            "[outbound handler] - [UDP], routing loop detected, drop connection from {:?}",
+                            egress_local_addr
+                        );
+                        if return_on_loophole {
+                            detector.lock().await.remove(&egress_local_addr);
+                            return;
+                        }
+                    }
+                    detector.lock().await.insert_outbound(egress_local_addr);
+
                     // pipe between two udp sockets
                     let _ = remote_socket.send(&data).await;
                     loop {
@@ -240,6 +373,7 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
                             }
                         }
                     }
+                    detector.lock().await.remove(&egress_local_addr);
                 }
                 Err(e) => warn!(
                     "failed to new udp socket {:?}=>{:?}, err: {:?}",
@@ -253,7 +387,9 @@ async fn handle_inbound_datagram(udp_socket: UdpSocket, interface: String) {
 async fn new_tcp_stream<'a>(addr: SocketAddr, iface: &str) -> std::io::Result<TcpStream> {
     use socket2_ext::{AddressBinding, BindDeviceOption};
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
-    socket.bind_to_device(BindDeviceOption::v4(iface))?;
+    if std::env::var("ROUTING_LOOP_DETECTOR_NO_BIND") != Ok("1".into()) {
+        socket.bind_to_device(BindDeviceOption::v4(iface))?;
+    }
     socket.set_keepalive(true)?;
     socket.set_nodelay(true)?;
     socket.set_nonblocking(true)?;
@@ -268,7 +404,9 @@ async fn new_tcp_stream<'a>(addr: SocketAddr, iface: &str) -> std::io::Result<Tc
 async fn new_udp_packet(addr: SocketAddr, iface: &str) -> std::io::Result<tokio::net::UdpSocket> {
     use socket2_ext::{AddressBinding, BindDeviceOption};
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    socket.bind_to_device(BindDeviceOption::v4(iface))?;
+    if std::env::var("ROUTING_LOOP_DETECTOR_NO_BIND") != Ok("1".into()) {
+        socket.bind_to_device(BindDeviceOption::v4(iface))?;
+    }
     socket.set_nonblocking(true)?;
 
     let socket = tokio::net::UdpSocket::from_std(socket.into());
